@@ -1674,7 +1674,12 @@ async function requestAssistantTurn() {
 		lastUsageSystemTokens = lastPromptTokens ? sentSystemTokens : 0;
 		const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
 		if (mustReadAfterFileChange) {
-			if (calls.length !== forcedReadPaths.length || calls.some((call) => call?.function?.name !== "read_file")) {
+			// Some endpoints (e.g. Cerebras) return only one tool call per response,
+			// even when several reads are required. So we accept any non-empty subset
+			// of the required reads here. Paths read this round are removed from
+			// pendingRequiredReads below, and the next round forces the rest.
+			// Before: calls.length had to equal forcedReadPaths.length exactly.
+			if (calls.length === 0 || calls.length > forcedReadPaths.length || calls.some((call) => call?.function?.name !== "read_file")) {
 				throw new Error(`The model endpoint did not honor MinAgent's required read_file calls for ${forcedReadPaths.join(", ")}. The file change was not accepted as complete.`);
 			}
 			const expectedPaths = new Set(forcedReadPaths.map(normalizeWorkspacePath));
