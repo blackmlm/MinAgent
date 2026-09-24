@@ -2,6 +2,14 @@ const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_TOOL_ARGUMENT_CHARS = 1024 * 1024;
 const RETRYABLE_NETWORK_ERRORS = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT"]);
+// HTTP statuses that mean "the server is busy, try again later".
+// Hosted endpoints like Cerebras return 429 (queue full) or 504 (gateway
+// timeout) under high traffic. These usually succeed after a short wait.
+const RETRYABLE_HTTP_STATUSES = new Set([429, 502, 503, 504]);
+// Total tries for busy-server responses: 1 first try + 3 retries.
+const MAX_BUSY_ATTEMPTS = 4;
+// Longest wait between retries, so a large Retry-After header cannot stall us.
+const MAX_RETRY_DELAY_MS = 20 * 1000;
 
 export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs = DEFAULT_TIMEOUT_MS, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES }) {
 	if (!endpoint || !model || !Array.isArray(tools)) throw new Error("OpenAI client configuration is incomplete.");
@@ -16,7 +24,9 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 			}
 			if (options.maxTokens) requestBody.max_tokens = options.maxTokens;
 			let response;
-			for (let attempt = 0; attempt < 2; attempt += 1) {
+			// Before: this loop ran at most 2 times and only retried network errors.
+			// Now it also retries busy-server HTTP statuses (see RETRYABLE_HTTP_STATUSES).
+			for (let attempt = 0; attempt < MAX_BUSY_ATTEMPTS; attempt += 1) {
 				try {
 					response = await fetch(endpoint, {
 						method: "POST",
@@ -25,6 +35,12 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 						redirect: "error",
 						signal: timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined,
 					});
+					// Server is busy and we have tries left: wait, then try again.
+					if (RETRYABLE_HTTP_STATUSES.has(response.status) && attempt < MAX_BUSY_ATTEMPTS - 1) {
+						await response.body?.cancel().catch(() => {});
+						await new Promise((resolve) => setTimeout(resolve, retryDelayMs(response, attempt)));
+						continue;
+					}
 					break;
 				} catch (error) {
 					const code = error?.cause?.code;
@@ -48,6 +64,17 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 			throw new Error(`The endpoint did not return a streaming response (Content-Type: ${contentType || "unknown"}). Response: ${bodyText}`);
 		},
 	};
+}
+
+// How long to wait before retrying a busy-server response.
+// Uses the server's Retry-After header (in seconds) when it sends one.
+// Otherwise waits 1s, 2s, 4s... (doubling each attempt).
+function retryDelayMs(response, attempt) {
+	const retryAfterSeconds = Number(response.headers.get("retry-after"));
+	const delay = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+		? retryAfterSeconds * 1000
+		: 1000 * 2 ** attempt;
+	return Math.min(delay, MAX_RETRY_DELAY_MS);
 }
 
 async function readResponsePrefix(response, maxBytes) {
