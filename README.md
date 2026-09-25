@@ -168,6 +168,7 @@ Likely secrets are redacted before writing. When the file grows past 5 MB, it is
 - `src/mcp.mjs`: MCP configuration, transports, tool discovery, and result handling.
 - `src/init-project.mjs`: project file selection for `/init`.
 - `src/error-log.mjs`: error log in `logs/errors.jsonl`.
+- `src/status-bar.mjs`: live context bar pinned to the bottom terminal row.
 - `minagent.cmd` and `minagent.ps1`: Windows launchers.
 
 ## License and notice

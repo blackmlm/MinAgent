@@ -21,6 +21,7 @@ import { readFile, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createErrorLog } from "./error-log.mjs";
+import { createStatusBar } from "./status-bar.mjs";
 
 const MAX_TOOL_ROUNDS = 32;
 const MAX_ATTACHED_IMAGES = 4;
@@ -739,13 +740,31 @@ function printStartupPanel() {
 	uiPrint(`${uiText("/", "magenta", true)} ${uiText("commands", "muted")}  ${uiText("@", "cyan", true)} ${uiText("files", "muted")}  ${uiText("Ctrl+J", "pale", true)} ${uiText("new line", "muted")}  ${uiText("Alt+V", "pale", true)} ${uiText("paste image", "muted")}`);
 }
 
-function printTurnStatus() {
+// Live state shown in the bottom status bar (see status-bar.mjs).
+// turnActive: true while the model is working on a request.
+// liveReplyTokens: estimated tokens received so far in the current reply
+// (text + reasoning). Reset before each request.
+let turnActive = false;
+let liveReplyTokens = 0;
+
+// Text for the pinned bottom row. Built as plain text first, so it can be
+// cut to the terminal width, then colored.
+function statusBarText(columns) {
 	const { used, percent } = contextUsage();
-	const context = `Context ~${tokenCount(used)} / ${tokenCount(contextWindow)} (${percent.toFixed(1)}%) ${usageMeter(percent)}`;
+	let text = `◆ ${model}  Context ~${tokenCount(used)} / ${tokenCount(contextWindow)} (${percent.toFixed(1)}%) ${usageMeter(percent)}`;
+	if (turnActive) text += liveReplyTokens > 0 ? `  · receiving ~${tokenCount(liveReplyTokens)} tokens` : "  · working";
+	return uiText(truncateTerminalText(text, Math.max(1, columns - 1)), "cyan");
+}
+
+const statusBar = createStatusBar({ output: stdout, getText: statusBarText });
+
+function printTurnStatus() {
+	// The model and context line moved to the pinned bottom status bar.
+	// Before: "◆ model  Context ~N / M (x%)" was printed here and then
+	// scrolled away while the model worked.
 	// Show the reasoning mode so users know Ctrl+O exists.
 	const modes = `Input ${inputModalities.join(" · ")}  Terminal ${terminalModeLabel()}  Reasoning ${showReasoning ? "On" : "Off"} (Ctrl+O)`;
 	uiPrint("");
-	uiPrint(`${uiText("◆", "magenta")} ${uiText(model, "pale", true)}  ${uiText(context, "cyan")}`);
 	uiPrint(`${uiText(modes, "muted")}`);
 }
 
@@ -1602,6 +1621,8 @@ async function startNewConversation() {
 	lastUsageSystemTokens = 0;
 	await refreshWorkspaceSnapshot();
 	stdout.write("\u001b[2J\u001b[H");
+	// The clear also erased the bottom status bar; draw it again now.
+	statusBar.draw();
 	printStartupPanel();
 	uiPrint(uiText("◆ New conversation ready.", "cyan", true));
 }
@@ -1776,11 +1797,20 @@ async function requestAssistantTurn() {
 			const requestMessages = emptyResponseRetries > 0
 				? [...messages, { role: "user", content: "Your previous reply was empty. Keep reasoning short. Now either call a tool or give your final answer." }]
 				: messages;
+			// New request: the live "receiving" count starts from zero.
+			liveReplyTokens = 0;
 			try {
 				completion = await callChatCompletions(requestMessages, {
 					withTools: true,
-					onTextDelta: (chunk) => streamedOutput.write(chunk),
-					onReasoningDelta: (chunk) => reasoningOutput.write(chunk),
+					// Also count received tokens, so the status bar shows them live.
+					onTextDelta: (chunk) => {
+						liveReplyTokens += estimateTextTokens(chunk);
+						streamedOutput.write(chunk);
+					},
+					onReasoningDelta: (chunk) => {
+						liveReplyTokens += estimateTextTokens(chunk);
+						reasoningOutput.write(chunk);
+					},
 				});
 			} finally {
 				streamedOutput.close();
@@ -1942,6 +1972,10 @@ async function main() {
 		};
 		stdout.write(BRACKETED_PASTE_ENABLE);
 		process.once("exit", disableBracketedPaste);
+		// Pin the live context bar to the bottom row. On exit (normal or
+		// crash) restore normal scrolling, so the terminal is not left broken.
+		statusBar.start();
+		process.once("exit", statusBar.stop);
 		let autocompleteState = null;
 		let autocompletePanelVisible = false;
 		let dismissedAutocompleteSignature = "";
@@ -2153,7 +2187,15 @@ async function main() {
 					printUserBubble(input);
 					const preparedMessage = await prepareUserMessage(input, fileReferences);
 					messages.push(preparedMessage.message);
-					await requestAssistantTurn();
+					// turnActive and liveReplyTokens feed the live status bar.
+					turnActive = true;
+					try {
+						await requestAssistantTurn();
+					} finally {
+						turnActive = false;
+						liveReplyTokens = 0;
+						statusBar.draw();
+					}
 				} catch (error) {
 					printError(error);
 				}
