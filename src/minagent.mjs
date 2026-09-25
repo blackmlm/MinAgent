@@ -1475,8 +1475,11 @@ function estimateCurrentContextTokens() {
 
 function callChatCompletions(requestMessages, options = {}) {
 	// Show a notice each time the endpoint is busy (429/5xx) and we retry.
-	const onRetry = ({ status, attempt, maxAttempts, delayMs }) => {
-		uiPrint(uiText(`Endpoint busy (HTTP ${status}). Retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt + 1}/${maxAttempts})...`, "warning"));
+	// token_quota_exceeded gets its own wording: it is our per-minute token
+	// limit, not a busy server, and it can take up to ~75s to clear.
+	const onRetry = ({ status, errorCode, attempt, maxAttempts, delayMs }) => {
+		const reason = errorCode === "token_quota_exceeded" ? "Token-per-minute limit reached" : "Endpoint busy";
+		uiPrint(uiText(`${reason} (HTTP ${status}). Retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt + 1}/${maxAttempts})...`, "warning"));
 	};
 	return openAiClient.complete(requestMessages, { onRetry, ...options });
 }

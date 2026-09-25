@@ -12,6 +12,11 @@ const RETRYABLE_HTTP_STATUSES = new Set([429, 502, 503, 504]);
 const MAX_BUSY_ATTEMPTS = 10;
 // Wait between busy-server retries (user asked for 3 seconds).
 const BUSY_RETRY_DELAY_MS = 3 * 1000;
+// Total tries for Cerebras "token_quota_exceeded" (tokens-per-minute limit):
+// 1 first try + 24 retries, ~75s at 3s each.
+// The limit refills slowly (~2.5K tokens/s for a 150K/min key), so a large
+// request (70K+ tokens) can need 30-50s before it fits. ~30s was not enough.
+const MAX_TOKEN_QUOTA_ATTEMPTS = 25;
 // Longest wait between retries, so a large Retry-After header cannot stall us.
 const MAX_RETRY_DELAY_MS = 20 * 1000;
 
@@ -30,8 +35,14 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 			let response;
 			// Before: this loop ran at most 2 times and only retried network errors.
 			// Now it also retries busy-server HTTP statuses (see RETRYABLE_HTTP_STATUSES).
-			for (let attempt = 0; attempt < MAX_BUSY_ATTEMPTS; attempt += 1) {
+			// Body of the last busy response. We read it to find the error code,
+			// so it cannot be read again later; the final error message uses it.
+			let busyBodyText = "";
+			// The loop bound is the larger limit. Each error type stops at its own
+			// limit below (MAX_BUSY_ATTEMPTS or MAX_TOKEN_QUOTA_ATTEMPTS).
+			for (let attempt = 0; attempt < MAX_TOKEN_QUOTA_ATTEMPTS; attempt += 1) {
 				try {
+					busyBodyText = "";
 					response = await fetch(endpoint, {
 						method: "POST",
 						headers,
@@ -39,14 +50,21 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 						redirect: "error",
 						signal: timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined,
 					});
-					// Server is busy and we have tries left: wait, then try again.
-					if (RETRYABLE_HTTP_STATUSES.has(response.status) && attempt < MAX_BUSY_ATTEMPTS - 1) {
-						await response.body?.cancel().catch(() => {});
-						const delayMs = retryDelayMs(response);
-						// Let the caller show a notice, so the user sees why it waits.
-						options.onRetry?.({ status: response.status, attempt: attempt + 1, maxAttempts: MAX_BUSY_ATTEMPTS, delayMs });
-						await new Promise((resolve) => setTimeout(resolve, delayMs));
-						continue;
+					if (RETRYABLE_HTTP_STATUSES.has(response.status)) {
+						// Read the body to learn which limit was hit, e.g.
+						// "queue_exceeded" (server busy) or "token_quota_exceeded"
+						// (our tokens-per-minute limit). The token limit gets more tries.
+						busyBodyText = await readResponsePrefix(response, 8 * 1024);
+						const errorCode = busyBodyText.match(/"code"\s*:\s*"([a-z_]+)"/)?.[1] ?? "";
+						const maxAttempts = errorCode === "token_quota_exceeded" ? MAX_TOKEN_QUOTA_ATTEMPTS : MAX_BUSY_ATTEMPTS;
+						// Tries left: wait, then try again.
+						if (attempt < maxAttempts - 1) {
+							const delayMs = retryDelayMs(response);
+							// Let the caller show a notice, so the user sees why it waits.
+							options.onRetry?.({ status: response.status, errorCode, attempt: attempt + 1, maxAttempts, delayMs });
+							await new Promise((resolve) => setTimeout(resolve, delayMs));
+							continue;
+						}
 					}
 					break;
 				} catch (error) {
@@ -60,7 +78,8 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 				}
 			}
 			if (!response.ok) {
-				const bodyText = await readResponsePrefix(response, 8 * 1024);
+				// Reuse the busy body if we already read it in the retry loop.
+				const bodyText = busyBodyText || await readResponsePrefix(response, 8 * 1024);
 				throw new Error(`Endpoint returned HTTP ${response.status}: ${bodyText}`);
 			}
 			const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
