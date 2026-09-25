@@ -15,6 +15,8 @@ import { buildAutocompleteState, handleControlJInput, handlePastedInput } from "
 import { SUMMARY_INSTRUCTIONS, estimateMessageTokens, estimateTextTokens, findCompactionCutPoint, serializeForSummary } from "./context.mjs";
 import { graphemes, safeTerminalText, terminalCharacterWidth, terminalRowsForInput, terminalTextWidth, wrapMessage } from "./terminal-text.mjs";
 import { collectProjectEssentials } from "./init-project.mjs";
+// Alt+V: save a clipboard image (screenshot) to a temp PNG.
+import { saveClipboardImage } from "./clipboard.mjs";
 import { readFile, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -698,7 +700,7 @@ function printStartupPanel() {
 		}
 	}
 	uiPrint(uiText(edge("╰", "╯"), "cyan"));
-	uiPrint(`${uiText("/", "magenta", true)} ${uiText("commands", "muted")}  ${uiText("@", "cyan", true)} ${uiText("files", "muted")}  ${uiText("Ctrl+J", "pale", true)} ${uiText("new line", "muted")}`);
+	uiPrint(`${uiText("/", "magenta", true)} ${uiText("commands", "muted")}  ${uiText("@", "cyan", true)} ${uiText("files", "muted")}  ${uiText("Ctrl+J", "pale", true)} ${uiText("new line", "muted")}  ${uiText("Alt+V", "pale", true)} ${uiText("paste image", "muted")}`);
 }
 
 function printTurnStatus() {
@@ -1870,6 +1872,29 @@ async function main() {
 				showReasoning = !showReasoning;
 				print("");
 				uiPrint(uiText(showReasoning ? "Reasoning visible · Ctrl+O to hide" : "Reasoning hidden · Ctrl+O to show", "muted"));
+				return;
+			}
+			// Alt+V pastes a clipboard image (e.g. a Win+Shift+S screenshot).
+			// It saves the image as a temp PNG and types its quoted path into
+			// the prompt. prepareUserMessage already attaches quoted image
+			// paths, so no other code is needed to send the image.
+			if (key?.meta && key.name === "v") {
+				// "unbound" stops readline from handling the key itself.
+				key.name = "unbound";
+				saveClipboardImage().then((filePath) => {
+					if (filePath) {
+						terminal.write(`"${filePath}" `);
+						return;
+					}
+					print("");
+					uiPrint(uiText("No image in the clipboard. Take a screenshot (Win+Shift+S), then press Alt+V.", "warning"));
+					// Redraw the prompt and the text typed so far.
+					terminal.prompt(true);
+				}).catch((error) => {
+					print("");
+					uiPrint(uiText(`Could not paste image: ${error.message}`, "error"));
+					terminal.prompt(true);
+				});
 				return;
 			}
 			// Keep pasted line breaks inside this prompt instead of letting readline submit each line.
