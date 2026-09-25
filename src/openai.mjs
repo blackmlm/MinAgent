@@ -141,9 +141,14 @@ export async function readStreamingResponse(response, onTextDelta, maxResponseBy
 		if (!choice) return;
 		if (choice.finish_reason) finishReason = choice.finish_reason;
 		const delta = choice.delta ?? {};
+		// Endpoints name the reasoning field differently.
+		// Cerebras sends it as `delta.reasoning`; others use `reasoning_content`
+		// or `reasoning_summary`. Without the `reasoning` case, Cerebras
+		// reasoning was dropped and nothing showed during "Processing...".
 		const reasoningDelta = typeof delta.reasoning_summary === "string" && delta.reasoning_summary
 			? delta.reasoning_summary
-			: typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
+			: typeof delta.reasoning_content === "string" && delta.reasoning_content ? delta.reasoning_content
+			: typeof delta.reasoning === "string" ? delta.reasoning : "";
 		if (reasoningDelta) {
 			onReasoningDelta?.(reasoningDelta);
 		}
