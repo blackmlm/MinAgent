@@ -704,7 +704,8 @@ function printStartupPanel() {
 function printTurnStatus() {
 	const { used, percent } = contextUsage();
 	const context = `Context ~${tokenCount(used)} / ${tokenCount(contextWindow)} (${percent.toFixed(1)}%) ${usageMeter(percent)}`;
-	const modes = `Input ${inputModalities.join(" · ")}  Terminal ${terminalModeLabel()}`;
+	// Show the reasoning mode so users know Ctrl+O exists.
+	const modes = `Input ${inputModalities.join(" · ")}  Terminal ${terminalModeLabel()}  Reasoning ${showReasoning ? "On" : "Off"} (Ctrl+O)`;
 	uiPrint("");
 	uiPrint(`${uiText("◆", "magenta")} ${uiText(model, "pale", true)}  ${uiText(context, "cyan")}`);
 	uiPrint(`${uiText(modes, "muted")}`);
@@ -1443,6 +1444,9 @@ function createReasoningStreamingOutput() {
 	let lastCharacter = "";
 	return {
 		write(chunk) {
+			// Ctrl+O flips showReasoning at any time. Checking it here (not when
+			// the output is created) lets the toggle apply mid-response.
+			if (!showReasoning) return;
 			const text = safeTerminalText(chunk);
 			if (!text) return;
 			if (!wroteOutput) {
@@ -1645,7 +1649,10 @@ async function requestAssistantTurn() {
 		const sentMessageCount = messages.length;
 		const sentSystemTokens = estimateTextTokens(messages[0].content);
 		const streamedOutput = createStreamingOutput(`Model · ${model}`);
-		const reasoningOutput = showReasoning ? createReasoningStreamingOutput() : null;
+		// Always create the reasoning output. It checks showReasoning on each
+		// write, so Ctrl+O can turn it on or off while the model is working.
+		// Before: it was only created when showReasoning was on at round start.
+		const reasoningOutput = createReasoningStreamingOutput();
 		print("");
 		uiPrint(uiText("Processing...", "muted"));
 		let completion;
@@ -1862,6 +1869,15 @@ async function main() {
 			autocompletePanelVisible = showAutocompletePanel(terminal, next, autocompletePanelVisible);
 		};
 		const keypressCapture = (character, key) => {
+			// Ctrl+O shows or hides the model's reasoning.
+			// This listener stays attached while the model works, so the key
+			// also works during "Processing...".
+			if (key?.ctrl && key.name === "o") {
+				showReasoning = !showReasoning;
+				print("");
+				uiPrint(uiText(showReasoning ? "Reasoning visible · Ctrl+O to hide" : "Reasoning hidden · Ctrl+O to show", "muted"));
+				return;
+			}
 			// Keep pasted line breaks inside this prompt instead of letting readline submit each line.
 			if (handlePastedInput(key, character, terminal, pasteState)) {
 				if ((pasteState.active || pasteState.bulkInputChunk) && autocompletePanelVisible) {
