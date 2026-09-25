@@ -1799,7 +1799,11 @@ async function requestAssistantTurn() {
 			}
 			if ((name === "edit_file" || name === "write_file") && normalizedPath) {
 				if (name === "edit_file" && toolFailed) {
-					pendingRequiredReads.set(normalizedPath, args.path);
+					// A failed edit forces a reread of the file. But when the error
+					// already shows the current lines ("Current text near line N",
+					// see describeNearbyText in workspace.mjs), a full reread only
+					// wastes context and pushes the turn toward compaction. Skip it then.
+					if (!String(result).includes("Current text near line")) pendingRequiredReads.set(normalizedPath, args.path);
 				} else if (!toolFailed) {
 					pendingRequiredReads.set(normalizedPath, args.path);
 				}

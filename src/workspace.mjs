@@ -169,6 +169,29 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		return output;
 	}
 
+	// Builds the hint for a failed edit_file.
+	// The usual cause is stale old_text: an earlier edit changed that area,
+	// or the model retyped a big block slightly wrong.
+	// Before: the hint only said "reread the file". A full reread of a big
+	// file uses a lot of context and pushes the turn toward compaction.
+	// Now: if the first line of old_text still exists, we show the CURRENT
+	// lines around it, so the model can rebuild the edit without a reread.
+	function describeNearbyText(content, oldText) {
+		const firstLine = oldText.split("\n").map((line) => line.trim()).find((line) => line.length > 0);
+		const lines = content.split("\n");
+		// Short lines like "}" or "];" match in many places, so the snippet
+		// could show the wrong area. Only use lines with 8+ characters.
+		const lineIndex = firstLine?.length >= 8 ? lines.findIndex((line) => line.includes(firstLine)) : -1;
+		if (lineIndex < 0) {
+			return "Reread this path with read_file, then rebuild the edit from its current contents. Use a small exact block of a few lines.";
+		}
+		// Show the matching line plus about 10 lines after it (and 2 before).
+		const start = Math.max(0, lineIndex - 2);
+		const end = Math.min(lines.length, lineIndex + 10);
+		const snippet = lines.slice(start, end).map((line, i) => `${start + i + 1}: ${line}`).join("\n");
+		return `The first line of old_text is at line ${lineIndex + 1}, but the text after it differs. Current text near line ${lineIndex + 1} (line numbers are not part of the file):\n${snippet}\nRebuild old_text from these exact current lines. Use a small exact block.`;
+	}
+
 	async function editFileTool(args) {
 		if (typeof args.old_text !== "string" || args.old_text.length === 0) throw new Error("old_text must be a non-empty string.");
 		if (typeof args.new_text !== "string") throw new Error("new_text must be a string.");
@@ -178,7 +201,7 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		const target = resolvePath(args.path);
 		const { content, entry } = await readText(target, "edit_file");
 		const firstIndex = content.indexOf(args.old_text);
-		if (firstIndex < 0) throw new Error(`old_text was not found in ${args.path}; no changes were made. Reread this path with read_file, then rebuild the edit from its current contents.`);
+		if (firstIndex < 0) throw new Error(`old_text was not found in ${args.path}; no changes were made. ${describeNearbyText(content, args.old_text)}`);
 		if (content.indexOf(args.old_text, firstIndex + args.old_text.length) >= 0) throw new Error(`old_text occurs more than once in ${args.path}; no changes were made. Reread this path with read_file and choose a unique exact text block.`);
 		const changed = content.slice(0, firstIndex) + args.new_text + content.slice(firstIndex + args.old_text.length);
 		await writeAtomically(target, changed, entry);
