@@ -1689,6 +1689,8 @@ async function requestAssistantTurn() {
 		const mustReadAfterFileChange = forcedReadPaths.length > 0;
 		let calls;
 		let message;
+		// Why the model stopped ("stop", "length", ...). Shown for empty replies.
+		let finishReason = "";
 		// Declared here because the final-text code below also reads it.
 		let streamedOutput;
 		if (mustReadAfterFileChange) {
@@ -1717,8 +1719,15 @@ async function requestAssistantTurn() {
 			print("");
 			uiPrint(uiText("Processing...", "muted"));
 			let completion;
+			// After an empty reply, add a short TEMPORARY nudge to this one
+			// request. It is not pushed into `messages`, so history stays clean.
+			// Before: the retry resent the exact same request, which usually
+			// failed the same way and just doubled the tokens used.
+			const requestMessages = emptyResponseRetries > 0
+				? [...messages, { role: "user", content: "Your previous reply was empty. Keep reasoning short. Now either call a tool or give your final answer." }]
+				: messages;
 			try {
-				completion = await callChatCompletions(messages, {
+				completion = await callChatCompletions(requestMessages, {
 					withTools: true,
 					onTextDelta: (chunk) => streamedOutput.write(chunk),
 					onReasoningDelta: (chunk) => reasoningOutput.write(chunk),
@@ -1729,6 +1738,7 @@ async function requestAssistantTurn() {
 			}
 			const { payload } = completion;
 			message = completion.message;
+			finishReason = payload?.finish_reason ?? "";
 			const promptTokens = Number(payload?.usage?.prompt_tokens);
 			lastPromptTokens = Number.isFinite(promptTokens) && promptTokens > 0 ? promptTokens : undefined;
 			lastUsageMessageCount = lastPromptTokens ? sentMessageCount : 0;
@@ -1739,11 +1749,16 @@ async function requestAssistantTurn() {
 			const finalText = assistantText(message.content ?? message.refusal ?? "");
 			if (!finalText.trim()) {
 				emptyResponseRetries += 1;
+				// Say WHY the reply was empty. "length" means the model hit its
+				// output limit, usually by spending it all on reasoning.
+				const reasonText = finishReason === "length"
+					? "the model used all its output tokens (likely on reasoning)"
+					: `finish reason: ${finishReason || "unknown"}`;
 				if (emptyResponseRetries < 2) {
-					uiPrint(uiText("The endpoint returned an empty response; retrying once.", "warning"));
+					uiPrint(uiText(`The endpoint returned an empty response (${reasonText}); retrying once with a nudge.`, "warning"));
 					continue;
 				}
-				throw new Error("The endpoint returned an empty assistant response twice. Check that the selected model supports Chat Completions and tool-call follow-up messages.");
+				throw new Error(`The endpoint returned an empty assistant response twice (${reasonText}). Check that the selected model supports Chat Completions and tool-call follow-up messages.`);
 			}
 			emptyResponseRetries = 0;
 			if (finalText && !streamedOutput?.hasOutput) {
