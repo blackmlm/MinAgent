@@ -70,7 +70,7 @@ const tools = [
 		function: {
 			name: "read_file",
 			description:
-				"Read a text or supported image file inside the current workspace when its contents are needed for the user's request. If an edit_file call fails, reread that same path before retrying. After editing or writing a file, read it back to verify the result. Use the workspace inventory to find paths; this tool does not list directories.",
+				"Read a text or supported image file inside the current workspace when its contents are needed for the user's request. If an edit_file call fails and its error does not show the current lines, reread that same path before retrying. After write_file, read the file back to verify the result. A successful edit_file already returns the changed lines, so do not reread the whole file after it. Use the workspace inventory to find paths; this tool does not list directories.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -87,7 +87,7 @@ const tools = [
 		function: {
 			name: "edit_file",
 			description:
-				"Replace one exact, unique piece of text in an existing workspace file after reading it with read_file. If an edit fails, reread this same path, rebuild the edit from the latest contents, and retry when safe; never repeat unchanged failed arguments. After success, read the file back to verify the change.",
+				"Replace one exact, unique piece of text in an existing workspace file after reading it with read_file. If an edit fails, reread this same path, rebuild the edit from the latest contents, and retry when safe; never repeat unchanged failed arguments. When the error shows the current lines near the edit, rebuild the edit from those lines. After success, the result shows the changed lines; check them there instead of rereading the whole file.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -209,7 +209,7 @@ function buildBaseSystemPrompt() {
 		"The workspace inventory lists paths but does not contain file contents. Read user-named relevant files first, then inspect other relevant source, configuration, or tests as needed. Use additional read_file calls when output is truncated. Files explicitly attached by the user count as available context for those files. If a needed file cannot be read, state that limitation and do not claim to have inspected it.",
 		"## Recovery, iteration, and completion",
 		"Treat every tool error as unresolved work. If edit_file fails, immediately call read_file on that same path, inspect its current contents, revise the exact old_text/new_text using that evidence, and retry the edit when it is safe and possible. Never repeat the same failed edit arguments unchanged. If the file cannot be read or the requested edit cannot be made safely, explain the blocker and do not claim success.",
-		"Do not finish merely because a tool reports that it updated or wrote a file. Read back every edited or written file and confirm the requested change is present. For behavior changes, run relevant available checks or tests, inspect their output, and correct and recheck failures. Continue iterating until the user's stated requirements are met and the result has appropriate verification. If a blocker prevents completion, state that the request remains incomplete and give the evidence and reason.",
+		"Do not finish merely because a tool reports that it updated or wrote a file. Confirm every requested change is present: check the changed lines that edit_file returns, and read back every file written with write_file. For behavior changes, run relevant available checks or tests, inspect their output, and correct and recheck failures. Continue iterating until the user's stated requirements are met and the result has appropriate verification. If a blocker prevents completion, state that the request remains incomplete and give the evidence and reason.",
 		"Use only the tools listed in this request.",
 		"The read_file, edit_file, write_file, delete_file, and delete_directory tools are confined to the workspace root. Use the workspace inventory in the system context to locate files; there is no file-listing tool.",
 		"When writing a file, missing parent directories are created automatically. edit_file only changes an existing file. delete_file removes one file. delete_directory recursively removes one subdirectory and everything inside it; never use it on the workspace root, and verify the requested directory before deleting it.",
@@ -808,6 +808,12 @@ function printToolResult(name, args, result) {
 		uiPrint(`  ${uiText("└─", "cyan")} ${uiText("Command output", "muted")}`);
 		for (const line of shown.split(/\r?\n/)) uiPrint(`     ${uiText(line, "pale")}`);
 		if (shown.length < text.length) uiPrint(uiText("     [Output truncated on screen; the full result is available to the model.]", "muted"));
+		return;
+	}
+	if (name === "edit_file") {
+		// edit_file now returns the changed lines for the model. On screen,
+		// show only the first line ("Updated <path>.") to keep the UI short.
+		uiPrint(`  ${uiText("└─", "cyan")} ${uiText(`Updated ${args.path}.`, "pale")}`);
 		return;
 	}
 	uiPrint(`  ${uiText("└─", "cyan")} ${uiText(text, "pale")}`);
@@ -1694,7 +1700,9 @@ async function requestAssistantTurn() {
 		// Declared here because the final-text code below also reads it.
 		let streamedOutput;
 		if (mustReadAfterFileChange) {
-			// After write_file/edit_file, the changed files must be read back.
+			// After write_file (or a failed edit_file), the file must be read back.
+			// A successful edit_file no longer needs this: its result already
+			// shows the changed lines (see editFileTool in workspace.mjs).
 			// MinAgent now does these reads itself, without asking the model.
 			// Before: it asked the model with tool_choice "required" and a path
 			// enum. Cerebras did not follow that reliably: it sent duplicate
@@ -1819,7 +1827,10 @@ async function requestAssistantTurn() {
 					// see describeNearbyText in workspace.mjs), a full reread only
 					// wastes context and pushes the turn toward compaction. Skip it then.
 					if (!String(result).includes("Current text near line")) pendingRequiredReads.set(normalizedPath, args.path);
-				} else if (!toolFailed) {
+				} else if (!toolFailed && name === "write_file") {
+					// Only write_file forces a reread now. A successful edit_file
+					// returns the changed lines itself, so a full reread only cost
+					// an extra request and a full file copy in the context.
 					pendingRequiredReads.set(normalizedPath, args.path);
 				}
 			}

@@ -205,7 +205,21 @@ export function createWorkspaceAccess(rootDirectory, workspaceName, listLimit = 
 		if (content.indexOf(args.old_text, firstIndex + args.old_text.length) >= 0) throw new Error(`old_text occurs more than once in ${args.path}; no changes were made. Reread this path with read_file and choose a unique exact text block.`);
 		const changed = content.slice(0, firstIndex) + args.new_text + content.slice(firstIndex + args.old_text.length);
 		await writeAtomically(target, changed, entry);
-		return `Updated ${args.path}.`;
+		// Show the changed lines (plus 3 lines around them) as the readback.
+		// Before: only "Updated <path>." was returned, and MinAgent then forced
+		// a full reread of the file. That cost an extra request and a full file
+		// copy in the context for every single edit.
+		const changedLines = changed.split("\n");
+		const firstChangedLine = content.slice(0, firstIndex).split("\n").length - 1;
+		const lastChangedLine = firstChangedLine + args.new_text.split("\n").length - 1;
+		const start = Math.max(0, firstChangedLine - 3);
+		const end = Math.min(changedLines.length, lastChangedLine + 4);
+		// Cap the snippet, so a huge replacement does not flood the context.
+		const MAX_SNIPPET_LINES = 60;
+		const shownEnd = Math.min(end, start + MAX_SNIPPET_LINES);
+		let snippet = changedLines.slice(start, shownEnd).map((line, i) => `${start + i + 1}: ${line}`).join("\n");
+		if (shownEnd < end) snippet += `\n[... ${end - shownEnd} more changed lines not shown]`;
+		return `Updated ${args.path}. Current text around the change (line numbers are not part of the file):\n${snippet}`;
 	}
 
 	async function writeFileTool(args) {
