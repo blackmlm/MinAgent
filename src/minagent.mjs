@@ -1474,7 +1474,11 @@ function estimateCurrentContextTokens() {
 }
 
 function callChatCompletions(requestMessages, options = {}) {
-	return openAiClient.complete(requestMessages, options);
+	// Show a notice each time the endpoint is busy (429/5xx) and we retry.
+	const onRetry = ({ status, attempt, maxAttempts, delayMs }) => {
+		uiPrint(uiText(`Endpoint busy (HTTP ${status}). Retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt + 1}/${maxAttempts})...`, "warning"));
+	};
+	return openAiClient.complete(requestMessages, { onRetry, ...options });
 }
 
 async function generateCompactionSummary(messagesToSummarize, previousSummary, customInstructions, displayLabel = "Compaction") {
@@ -1621,20 +1625,6 @@ async function requestAssistantTurn() {
 		const normalized = path.replaceAll("\\", "/").replace(/^(?:\.\/)+/, "");
 		return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 	};
-	const readFileDefinition = tools.find((tool) => tool.function.name === "read_file");
-	const restrictReadToPaths = (paths) => ({
-		...readFileDefinition,
-		function: {
-			...readFileDefinition.function,
-			parameters: {
-				...readFileDefinition.function.parameters,
-				properties: {
-					...readFileDefinition.function.parameters.properties,
-					path: { ...readFileDefinition.function.parameters.properties.path, enum: paths },
-				},
-			},
-		},
-	});
 	const parseCallArguments = (call) => {
 		const rawArguments = call?.function?.arguments ?? "{}";
 		const args = typeof rawArguments === "string" ? JSON.parse(rawArguments) : rawArguments;
@@ -1648,105 +1638,58 @@ async function requestAssistantTurn() {
 	// - every path is a required path, and no path is read twice.
 	// Before: these checks threw errors. Now a false result triggers the
 	// fallback in the loop, where MinAgent does the reads itself.
-	// Removes repeated read_file calls for the same path, keeping the first.
-	// Cerebras sometimes asks to read the same file 2-3 times in one reply.
-	// That reply is still a valid reread, so we drop the copies instead of
-	// rejecting it. Other calls are kept as-is for requiredReadsHonored to check.
-	const dropDuplicateReads = (calls) => {
-		const seenPaths = new Set();
-		return calls.filter((call) => {
-			if (call?.function?.name !== "read_file") return true;
-			let path;
-			try {
-				path = parseCallArguments(call).path;
-			} catch {
-				return true;
-			}
-			if (typeof path !== "string") return true;
-			const normalizedPath = normalizeWorkspacePath(path);
-			if (seenPaths.has(normalizedPath)) return false;
-			seenPaths.add(normalizedPath);
-			return true;
-		});
-	};
-	const requiredReadsHonored = (calls, forcedReadPaths) => {
-		if (calls.length === 0 || calls.length > forcedReadPaths.length) return false;
-		const expectedPaths = new Set(forcedReadPaths.map(normalizeWorkspacePath));
-		const requestedPaths = new Set();
-		for (const call of calls) {
-			if (call?.function?.name !== "read_file") return false;
-			let readArguments;
-			try {
-				readArguments = parseCallArguments(call);
-			} catch {
-				return false;
-			}
-			const normalizedPath = typeof readArguments.path === "string" ? normalizeWorkspacePath(readArguments.path) : "";
-			if (!expectedPaths.has(normalizedPath) || requestedPaths.has(normalizedPath)) return false;
-			requestedPaths.add(normalizedPath);
-		}
-		return true;
-	};
 	for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
 		await refreshWorkspaceSnapshot();
 		await compactAutomaticallyIfNeeded();
 		const forcedReadPaths = [...pendingRequiredReads.values()];
 		const mustReadAfterFileChange = forcedReadPaths.length > 0;
-		const sentMessageCount = messages.length;
-		const sentSystemTokens = estimateTextTokens(messages[0].content);
-		const streamedOutput = createStreamingOutput(`Model · ${model}`);
-		// Always create the reasoning output. It checks showReasoning on each
-		// write, so Ctrl+O can turn it on or off while the model is working.
-		// Before: it was only created when showReasoning was on at round start.
-		const reasoningOutput = createReasoningStreamingOutput();
-		print("");
-		uiPrint(uiText("Processing...", "muted"));
-		let completion;
-		try {
-			completion = await callChatCompletions(messages, {
-				withTools: true,
-				...(mustReadAfterFileChange ? {
-					availableTools: [restrictReadToPaths(forcedReadPaths)],
-					toolChoice: "required",
-				} : {}),
-				onTextDelta: (chunk) => {
-					if (!mustReadAfterFileChange) streamedOutput.write(chunk);
-				},
-				onReasoningDelta: (chunk) => {
-					if (!mustReadAfterFileChange) reasoningOutput?.write(chunk);
-				},
-			});
-		} finally {
-			streamedOutput.close();
-			reasoningOutput?.close();
-		}
-		const { payload, message } = completion;
-		const promptTokens = Number(payload?.usage?.prompt_tokens);
-		lastPromptTokens = Number.isFinite(promptTokens) && promptTokens > 0 ? promptTokens : undefined;
-		lastUsageMessageCount = lastPromptTokens ? sentMessageCount : 0;
-		lastUsageSystemTokens = lastPromptTokens ? sentSystemTokens : 0;
-		// `let` because the forced-read fallback below may replace the calls.
-		let calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-		// Drop repeated reads first, so a reply like read_file x3 for one file
-		// counts as a valid reread instead of triggering the fallback below.
-		if (mustReadAfterFileChange) calls = dropDuplicateReads(calls);
-		if (mustReadAfterFileChange && !requiredReadsHonored(calls, forcedReadPaths)) {
-			// The endpoint ignored the forced reread. Cerebras does this now and
-			// then with larger contexts (seen at ~36k tokens): it may answer with
-			// text, nothing, or a different tool, even with tool_choice "required".
-			// Before: MinAgent threw an error here and the whole turn was lost.
-			// Now: MinAgent issues the read_file calls itself. The loop below runs
-			// them like normal model calls, so the model still sees the new
-			// file contents and pendingRequiredReads is cleared.
-			const returned = calls.length > 0
-				? `tool calls: ${calls.map((call) => call?.function?.name || "?").join(", ")}`
-				: assistantText(message.content ?? "").trim() ? "text only" : "an empty reply";
-			uiPrint(uiText(`The endpoint skipped the required reread (${returned}). MinAgent is rereading ${forcedReadPaths.join(", ")} itself.`, "warning"));
+		let calls;
+		let message;
+		// Declared here because the final-text code below also reads it.
+		let streamedOutput;
+		if (mustReadAfterFileChange) {
+			// After write_file/edit_file, the changed files must be read back.
+			// MinAgent now does these reads itself, without asking the model.
+			// Before: it asked the model with tool_choice "required" and a path
+			// enum. Cerebras did not follow that reliably: it sent duplicate
+			// reads, other paths, partial reads (limit: 1), or plain text.
+			// Doing it locally is reliable and saves one API request per round.
+			// The reads run through the normal tool loop below, so they show up
+			// in the UI and in the history, and pendingRequiredReads is cleared.
+			message = { role: "assistant", content: null };
 			calls = forcedReadPaths.map((path, index) => ({
 				id: `minagent-read-${round}-${index}`,
 				type: "function",
 				function: { name: "read_file", arguments: JSON.stringify({ path }) },
 			}));
+		} else {
+			const sentMessageCount = messages.length;
+			const sentSystemTokens = estimateTextTokens(messages[0].content);
+			streamedOutput = createStreamingOutput(`Model · ${model}`);
+			// Always create the reasoning output. It checks showReasoning on each
+			// write, so Ctrl+O can turn it on or off while the model is working.
+			// Before: it was only created when showReasoning was on at round start.
+			const reasoningOutput = createReasoningStreamingOutput();
+			print("");
+			uiPrint(uiText("Processing...", "muted"));
+			let completion;
+			try {
+				completion = await callChatCompletions(messages, {
+					withTools: true,
+					onTextDelta: (chunk) => streamedOutput.write(chunk),
+					onReasoningDelta: (chunk) => reasoningOutput.write(chunk),
+				});
+			} finally {
+				streamedOutput.close();
+				reasoningOutput.close();
+			}
+			const { payload } = completion;
+			message = completion.message;
+			const promptTokens = Number(payload?.usage?.prompt_tokens);
+			lastPromptTokens = Number.isFinite(promptTokens) && promptTokens > 0 ? promptTokens : undefined;
+			lastUsageMessageCount = lastPromptTokens ? sentMessageCount : 0;
+			lastUsageSystemTokens = lastPromptTokens ? sentSystemTokens : 0;
+			calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
 		}
 		if (calls.length === 0) {
 			const finalText = assistantText(message.content ?? message.refusal ?? "");
@@ -1759,7 +1702,7 @@ async function requestAssistantTurn() {
 				throw new Error("The endpoint returned an empty assistant response twice. Check that the selected model supports Chat Completions and tool-call follow-up messages.");
 			}
 			emptyResponseRetries = 0;
-			if (finalText && !streamedOutput.hasOutput) {
+			if (finalText && !streamedOutput?.hasOutput) {
 				const fallbackOutput = createStreamingOutput(`Model · ${model}`);
 				if (!mustReadAfterFileChange) fallbackOutput.write(finalText);
 				fallbackOutput.close();

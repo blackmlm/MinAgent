@@ -6,8 +6,12 @@ const RETRYABLE_NETWORK_ERRORS = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE",
 // Hosted endpoints like Cerebras return 429 (queue full) or 504 (gateway
 // timeout) under high traffic. These usually succeed after a short wait.
 const RETRYABLE_HTTP_STATUSES = new Set([429, 502, 503, 504]);
-// Total tries for busy-server responses: 1 first try + 3 retries.
-const MAX_BUSY_ATTEMPTS = 4;
+// Total tries for busy-server responses: 1 first try + 9 retries.
+// Before: 4 tries with 1s/2s/4s waits (~7s total), which was too short
+// when Cerebras stayed busy. Now ~30s total at 3s per retry.
+const MAX_BUSY_ATTEMPTS = 10;
+// Wait between busy-server retries (user asked for 3 seconds).
+const BUSY_RETRY_DELAY_MS = 3 * 1000;
 // Longest wait between retries, so a large Retry-After header cannot stall us.
 const MAX_RETRY_DELAY_MS = 20 * 1000;
 
@@ -38,7 +42,10 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 					// Server is busy and we have tries left: wait, then try again.
 					if (RETRYABLE_HTTP_STATUSES.has(response.status) && attempt < MAX_BUSY_ATTEMPTS - 1) {
 						await response.body?.cancel().catch(() => {});
-						await new Promise((resolve) => setTimeout(resolve, retryDelayMs(response, attempt)));
+						const delayMs = retryDelayMs(response);
+						// Let the caller show a notice, so the user sees why it waits.
+						options.onRetry?.({ status: response.status, attempt: attempt + 1, maxAttempts: MAX_BUSY_ATTEMPTS, delayMs });
+						await new Promise((resolve) => setTimeout(resolve, delayMs));
 						continue;
 					}
 					break;
@@ -68,12 +75,13 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 
 // How long to wait before retrying a busy-server response.
 // Uses the server's Retry-After header (in seconds) when it sends one.
-// Otherwise waits 1s, 2s, 4s... (doubling each attempt).
-function retryDelayMs(response, attempt) {
+// Otherwise waits a fixed BUSY_RETRY_DELAY_MS (3s).
+// Before: 1s, 2s, 4s (doubling each attempt).
+function retryDelayMs(response) {
 	const retryAfterSeconds = Number(response.headers.get("retry-after"));
 	const delay = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
 		? retryAfterSeconds * 1000
-		: 1000 * 2 ** attempt;
+		: BUSY_RETRY_DELAY_MS;
 	return Math.min(delay, MAX_RETRY_DELAY_MS);
 }
 
