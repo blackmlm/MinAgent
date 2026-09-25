@@ -1416,6 +1416,11 @@ function createStreamingOutput(label) {
 	return {
 		write(chunk) {
 			if (!opened) {
+				// Skip leading whitespace before the box opens. Cerebras often
+				// starts the text with "\n\n" and then only makes a tool call.
+				// Before: that opened an empty "Model" box.
+				chunk = chunk.trimStart();
+				if (!chunk) return;
 				print("");
 				bubbleWriter = createAssistantBubbleWriter(label);
 				renderer = new MarkdownTerminalRenderer((value) => bubbleWriter.write(value));
