@@ -67,3 +67,25 @@ export function findCompactionCutPoint(conversationMessages, keepRecentTokens, i
 	}
 	return cutIndex;
 }
+
+// Fallback cut point for ONE long turn (many tool calls, no new user message).
+// findCompactionCutPoint only cuts at user messages, so inside a long turn it
+// returns 0 and compaction used to fail with a fatal error.
+// Here we cut before an ASSISTANT message instead. That is always safe: an
+// assistant message is never in the middle of a tool call and its tool results.
+// Returns 0 when there is no valid cut (then the caller keeps the old error).
+export function findTurnCutPoint(conversationMessages, keepRecentTokens, imageTokenEstimate = 4800) {
+	let accumulatedTokens = 0;
+	for (let index = conversationMessages.length - 1; index > 0; index -= 1) {
+		accumulatedTokens += estimateMessageTokens(conversationMessages[index], imageTokenEstimate);
+		// Keep at least keepRecentTokens of recent history, then cut at the
+		// first assistant message at or before this point.
+		if (accumulatedTokens >= keepRecentTokens && conversationMessages[index].role === "assistant") return index;
+	}
+	// Not enough tokens to reach keepRecentTokens: cut at the LAST assistant
+	// message instead, so at least some older steps get summarized.
+	for (let index = conversationMessages.length - 1; index > 0; index -= 1) {
+		if (conversationMessages[index].role === "assistant") return index;
+	}
+	return 0;
+}

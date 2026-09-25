@@ -12,7 +12,7 @@ import { terminateProcessTree } from "./processes.mjs";
 import { approvalPreview, redactLikelySecrets } from "./secrets.mjs";
 import { createOpenAiClient } from "./openai.mjs";
 import { buildAutocompleteState, handleControlJInput, handlePastedInput } from "./editor.mjs";
-import { SUMMARY_INSTRUCTIONS, estimateMessageTokens, estimateTextTokens, findCompactionCutPoint, serializeForSummary } from "./context.mjs";
+import { SUMMARY_INSTRUCTIONS, estimateMessageTokens, estimateTextTokens, findCompactionCutPoint, findTurnCutPoint, serializeForSummary } from "./context.mjs";
 import { graphemes, safeTerminalText, terminalCharacterWidth, terminalRowsForInput, terminalTextWidth, wrapMessage } from "./terminal-text.mjs";
 import { collectProjectEssentials } from "./init-project.mjs";
 // Alt+V: save a clipboard image (screenshot) to a temp PNG.
@@ -1569,7 +1569,16 @@ async function compactAutomaticallyIfNeeded() {
 	const estimatedTokens = estimateCurrentContextTokens();
 	if (estimatedTokens <= threshold) return;
 	const conversationMessages = messages.slice(1);
-	const cutIndex = findCompactionCutPoint(conversationMessages, compactionKeepRecentTokens);
+	let cutIndex = findCompactionCutPoint(conversationMessages, compactionKeepRecentTokens);
+	// Set when we cut inside the current turn (see below).
+	let cutInsideTurn = false;
+	if (cutIndex <= 0) {
+		// Before: this threw a fatal error when one long turn (many tool
+		// calls, no new user message) filled the context window.
+		// Now: cut before an assistant message inside the turn instead.
+		cutIndex = findTurnCutPoint(conversationMessages, compactionKeepRecentTokens);
+		cutInsideTurn = true;
+	}
 	if (cutIndex <= 0) {
 		throw new Error("The current workspace inventory or active turn exceeds the compaction threshold; reduce WORKSPACE_LIST_LIMIT or send a shorter request.");
 	}
@@ -1578,6 +1587,12 @@ async function compactAutomaticallyIfNeeded() {
 	uiPrint(uiText("Summarizing earlier history.", "muted"));
 	const summary = await generateCompactionSummary(conversationMessages.slice(0, cutIndex), compactedSummary, "", "Automatic compaction");
 	const recentMessages = conversationMessages.slice(cutIndex);
+	// A mid-turn cut leaves the kept messages starting with an assistant
+	// message. Add a short user message first, so the request still starts
+	// with a user turn (some OpenAI-compatible APIs require that).
+	if (cutInsideTurn) {
+		recentMessages.unshift({ role: "user", content: "[Earlier steps of this task were compacted into the summary in the system prompt. Continue the current task.]" });
+	}
 	replaceConversation(recentMessages, summary);
 	const compactedTokens = estimateCurrentContextTokens();
 	uiPrint(uiText(`Compaction complete · ~${tokenCount(compactedTokens)} estimated tokens`, "cyan"));
