@@ -13,12 +13,17 @@ const MAX_BUSY_ATTEMPTS = 10;
 // Wait between busy-server retries (user asked for 3 seconds).
 const BUSY_RETRY_DELAY_MS = 3 * 1000;
 // Total tries for Cerebras "token_quota_exceeded" (tokens-per-minute limit):
-// 1 first try + 24 retries, ~75s at 3s each.
-// The limit refills slowly (~2.5K tokens/s for a 150K/min key), so a large
-// request (70K+ tokens) can need 30-50s before it fits. ~30s was not enough.
-const MAX_TOKEN_QUOTA_ATTEMPTS = 25;
+// 1 first try + 4 cooldowns (~2 min at 30s each).
+// Before: 25 tries 3s apart, printing a new line each time. Retrying every
+// 3s was wasteful: the limit refills slowly (~2.5K tokens/s for a 150K/min
+// key), so a large request (70K+ tokens) needs ~30s before it fits again.
+const MAX_TOKEN_QUOTA_ATTEMPTS = 5;
+// Cooldown before retrying after "token_quota_exceeded", when the server
+// does not say how long to wait (Cerebras sent no reset header in tests).
+const TOKEN_QUOTA_COOLDOWN_MS = 30 * 1000;
 // Longest wait between retries, so a large Retry-After header cannot stall us.
-const MAX_RETRY_DELAY_MS = 20 * 1000;
+// Before: 20s. Raised to 60s because the token limit resets per minute.
+const MAX_RETRY_DELAY_MS = 60 * 1000;
 
 export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs = DEFAULT_TIMEOUT_MS, maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES }) {
 	if (!endpoint || !model || !Array.isArray(tools)) throw new Error("OpenAI client configuration is incomplete.");
@@ -40,7 +45,8 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 			let busyBodyText = "";
 			// The loop bound is the larger limit. Each error type stops at its own
 			// limit below (MAX_BUSY_ATTEMPTS or MAX_TOKEN_QUOTA_ATTEMPTS).
-			for (let attempt = 0; attempt < MAX_TOKEN_QUOTA_ATTEMPTS; attempt += 1) {
+			// Math.max because either limit may be the larger one.
+			for (let attempt = 0; attempt < Math.max(MAX_BUSY_ATTEMPTS, MAX_TOKEN_QUOTA_ATTEMPTS); attempt += 1) {
 				try {
 					busyBodyText = "";
 					response = await fetch(endpoint, {
@@ -59,10 +65,13 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 						const maxAttempts = errorCode === "token_quota_exceeded" ? MAX_TOKEN_QUOTA_ATTEMPTS : MAX_BUSY_ATTEMPTS;
 						// Tries left: wait, then try again.
 						if (attempt < maxAttempts - 1) {
-							const delayMs = retryDelayMs(response);
-							// Let the caller show a notice, so the user sees why it waits.
-							options.onRetry?.({ status: response.status, errorCode, attempt: attempt + 1, maxAttempts, delayMs });
-							await new Promise((resolve) => setTimeout(resolve, delayMs));
+							const delayMs = retryDelayMs(response, errorCode);
+							// The caller decides how to wait, so the UI can show a live
+							// countdown. Without one, we just sleep.
+							// Before: onRetry printed a notice, then we slept here.
+							// retry = this retry's number, maxRetries = retries allowed.
+							const waitBeforeRetry = options.waitBeforeRetry ?? ((info) => sleep(info.delayMs));
+							await waitBeforeRetry({ status: response.status, errorCode, retry: attempt + 1, maxRetries: maxAttempts - 1, delayMs });
 							continue;
 						}
 					}
@@ -93,15 +102,23 @@ export function createOpenAiClient({ endpoint, apiKey, model, tools, timeoutMs =
 }
 
 // How long to wait before retrying a busy-server response.
-// Uses the server's Retry-After header (in seconds) when it sends one.
-// Otherwise waits a fixed BUSY_RETRY_DELAY_MS (3s).
-// Before: 1s, 2s, 4s (doubling each attempt).
-function retryDelayMs(response) {
-	const retryAfterSeconds = Number(response.headers.get("retry-after"));
-	const delay = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
-		? retryAfterSeconds * 1000
-		: BUSY_RETRY_DELAY_MS;
+// Uses the server's wait time (in seconds) when it sends one:
+// Retry-After, or x-ratelimit-reset-tokens-minute for the token limit.
+// Otherwise: TOKEN_QUOTA_COOLDOWN_MS (30s) for token_quota_exceeded,
+// and BUSY_RETRY_DELAY_MS (3s) for other busy errors.
+// Before: 1s, 2s, 4s (doubling), then a fixed 3s for every error type.
+function retryDelayMs(response, errorCode) {
+	const isTokenQuota = errorCode === "token_quota_exceeded";
+	const headerSeconds = Number(response.headers.get("retry-after")
+		?? (isTokenQuota ? response.headers.get("x-ratelimit-reset-tokens-minute") : null));
+	const delay = Number.isFinite(headerSeconds) && headerSeconds > 0
+		? headerSeconds * 1000
+		: isTokenQuota ? TOKEN_QUOTA_COOLDOWN_MS : BUSY_RETRY_DELAY_MS;
 	return Math.min(delay, MAX_RETRY_DELAY_MS);
+}
+
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function readResponsePrefix(response, maxBytes) {

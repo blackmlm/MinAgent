@@ -1480,15 +1480,34 @@ function estimateCurrentContextTokens() {
 	return messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0) + estimateTextTokens(JSON.stringify(tools));
 }
 
+// Shows ONE line that counts down every second, then resolves.
+// "\r" goes back to the start of the line and "\x1b[2K" clears it, so the
+// same line is rewritten instead of printing a new line each second.
+// buildMessage(secondsLeft) returns the text to show for that second.
+async function showCountdown(buildMessage, delayMs) {
+	const endTime = Date.now() + delayMs;
+	for (;;) {
+		const remainingMs = endTime - Date.now();
+		if (remainingMs <= 0) break;
+		stdout.write(`\r\x1b[2K${uiText(buildMessage(Math.ceil(remainingMs / 1000)), "warning")}`);
+		// Sleep until the next whole second, so the number drops 1 at a time.
+		await new Promise((resolve) => setTimeout(resolve, remainingMs % 1000 || 1000));
+	}
+	stdout.write(`\r\x1b[2K${uiText("Retrying now...", "muted")}\n`);
+}
+
 function callChatCompletions(requestMessages, options = {}) {
-	// Show a notice each time the endpoint is busy (429/5xx) and we retry.
+	// When the endpoint is busy (429/5xx), show a live cooldown countdown
+	// while openai.mjs waits to retry.
 	// token_quota_exceeded gets its own wording: it is our per-minute token
-	// limit, not a busy server, and it can take up to ~75s to clear.
-	const onRetry = ({ status, errorCode, attempt, maxAttempts, delayMs }) => {
-		const reason = errorCode === "token_quota_exceeded" ? "Token-per-minute limit reached" : "Endpoint busy";
-		uiPrint(uiText(`${reason} (HTTP ${status}). Retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt + 1}/${maxAttempts})...`, "warning"));
-	};
-	return openAiClient.complete(requestMessages, { onRetry, ...options });
+	// limit, not a busy server, so it waits longer (30s cooldowns).
+	// Before: onRetry printed a new warning line for every retry.
+	const waitBeforeRetry = ({ status, errorCode, retry, maxRetries, delayMs }) => showCountdown((secondsLeft) => (
+		errorCode === "token_quota_exceeded"
+			? `Token-per-minute limit reached (HTTP ${status}). Retrying in ${secondsLeft}s (cooldown ${retry}/${maxRetries})...`
+			: `Endpoint busy (HTTP ${status}). Retrying in ${secondsLeft}s (try ${retry}/${maxRetries})...`
+	), delayMs);
+	return openAiClient.complete(requestMessages, { waitBeforeRetry, ...options });
 }
 
 async function generateCompactionSummary(messagesToSummarize, previousSummary, customInstructions, displayLabel = "Compaction") {
