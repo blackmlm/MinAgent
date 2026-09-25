@@ -144,6 +144,18 @@ When `MCP_ENABLED=on`, MinAgent reads `.minagent/mcp.json` from the MinAgent ins
 
 MinAgent discovers the server tools at startup and exposes them to the model. It supports up to 32 configured servers and 256 tools. MCP text results are limited to 96 KiB, and supported MCP images follow the same 10 MiB and four-image limits as local attachments. MCP servers run with the user's account permissions.
 
+## Error log
+
+MinAgent saves every error to `logs/errors.jsonl` in the MinAgent folder (not in your project), so errors from all workspaces end up in one place. Each line is one JSON object with `time`, `kind`, `message`, `workspace`, `model`, and an estimated `contextTokens`, plus details for that kind:
+
+- `fatal`: the red ERROR box (turn, configuration, or compaction errors).
+- `tool`: a failed tool call, with the tool name and its arguments (cut to 500 characters).
+- `empty_response`: the model returned no text and no tool call, with the finish reason.
+- `endpoint_retry`: the endpoint was busy or hit the token-per-minute limit.
+- `compaction_in_turn`: one long turn had to be compacted in the middle.
+
+Likely secrets are redacted before writing. When the file grows past 5 MB, it is renamed to `errors.old.jsonl` and a new log starts. The `logs/` folder is ignored by git.
+
 ## Project layout
 
 - `src/minagent.mjs`: TUI, conversation loop, tool dispatch, rendering, commands, and attachments.
@@ -155,6 +167,7 @@ MinAgent discovers the server tools at startup and exposes them to the model. It
 - `src/skills.mjs`: local skill discovery and skill tools.
 - `src/mcp.mjs`: MCP configuration, transports, tool discovery, and result handling.
 - `src/init-project.mjs`: project file selection for `/init`.
+- `src/error-log.mjs`: error log in `logs/errors.jsonl`.
 - `minagent.cmd` and `minagent.ps1`: Windows launchers.
 
 ## License and notice
