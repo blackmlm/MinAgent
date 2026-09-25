@@ -1648,6 +1648,27 @@ async function requestAssistantTurn() {
 	// - every path is a required path, and no path is read twice.
 	// Before: these checks threw errors. Now a false result triggers the
 	// fallback in the loop, where MinAgent does the reads itself.
+	// Removes repeated read_file calls for the same path, keeping the first.
+	// Cerebras sometimes asks to read the same file 2-3 times in one reply.
+	// That reply is still a valid reread, so we drop the copies instead of
+	// rejecting it. Other calls are kept as-is for requiredReadsHonored to check.
+	const dropDuplicateReads = (calls) => {
+		const seenPaths = new Set();
+		return calls.filter((call) => {
+			if (call?.function?.name !== "read_file") return true;
+			let path;
+			try {
+				path = parseCallArguments(call).path;
+			} catch {
+				return true;
+			}
+			if (typeof path !== "string") return true;
+			const normalizedPath = normalizeWorkspacePath(path);
+			if (seenPaths.has(normalizedPath)) return false;
+			seenPaths.add(normalizedPath);
+			return true;
+		});
+	};
 	const requiredReadsHonored = (calls, forcedReadPaths) => {
 		if (calls.length === 0 || calls.length > forcedReadPaths.length) return false;
 		const expectedPaths = new Set(forcedReadPaths.map(normalizeWorkspacePath));
@@ -1706,6 +1727,9 @@ async function requestAssistantTurn() {
 		lastUsageSystemTokens = lastPromptTokens ? sentSystemTokens : 0;
 		// `let` because the forced-read fallback below may replace the calls.
 		let calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+		// Drop repeated reads first, so a reply like read_file x3 for one file
+		// counts as a valid reread instead of triggering the fallback below.
+		if (mustReadAfterFileChange) calls = dropDuplicateReads(calls);
 		if (mustReadAfterFileChange && !requiredReadsHonored(calls, forcedReadPaths)) {
 			// The endpoint ignored the forced reread. Cerebras does this now and
 			// then with larger contexts (seen at ~36k tokens): it may answer with
