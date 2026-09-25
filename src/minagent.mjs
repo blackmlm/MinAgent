@@ -1641,6 +1641,31 @@ async function requestAssistantTurn() {
 		if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Tool arguments must be a JSON object.");
 		return args;
 	};
+	// True when the model's reply is a valid forced reread:
+	// - at least one call, and no more calls than required paths.
+	//   (Cerebras sends one call per reply; the next round forces the rest.)
+	// - every call is read_file with valid JSON arguments.
+	// - every path is a required path, and no path is read twice.
+	// Before: these checks threw errors. Now a false result triggers the
+	// fallback in the loop, where MinAgent does the reads itself.
+	const requiredReadsHonored = (calls, forcedReadPaths) => {
+		if (calls.length === 0 || calls.length > forcedReadPaths.length) return false;
+		const expectedPaths = new Set(forcedReadPaths.map(normalizeWorkspacePath));
+		const requestedPaths = new Set();
+		for (const call of calls) {
+			if (call?.function?.name !== "read_file") return false;
+			let readArguments;
+			try {
+				readArguments = parseCallArguments(call);
+			} catch {
+				return false;
+			}
+			const normalizedPath = typeof readArguments.path === "string" ? normalizeWorkspacePath(readArguments.path) : "";
+			if (!expectedPaths.has(normalizedPath) || requestedPaths.has(normalizedPath)) return false;
+			requestedPaths.add(normalizedPath);
+		}
+		return true;
+	};
 	for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
 		await refreshWorkspaceSnapshot();
 		await compactAutomaticallyIfNeeded();
@@ -1679,31 +1704,25 @@ async function requestAssistantTurn() {
 		lastPromptTokens = Number.isFinite(promptTokens) && promptTokens > 0 ? promptTokens : undefined;
 		lastUsageMessageCount = lastPromptTokens ? sentMessageCount : 0;
 		lastUsageSystemTokens = lastPromptTokens ? sentSystemTokens : 0;
-		const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-		if (mustReadAfterFileChange) {
-			// Some endpoints (e.g. Cerebras) return only one tool call per response,
-			// even when several reads are required. So we accept any non-empty subset
-			// of the required reads here. Paths read this round are removed from
-			// pendingRequiredReads below, and the next round forces the rest.
-			// Before: calls.length had to equal forcedReadPaths.length exactly.
-			if (calls.length === 0 || calls.length > forcedReadPaths.length || calls.some((call) => call?.function?.name !== "read_file")) {
-				throw new Error(`The model endpoint did not honor MinAgent's required read_file calls for ${forcedReadPaths.join(", ")}. The file change was not accepted as complete.`);
-			}
-			const expectedPaths = new Set(forcedReadPaths.map(normalizeWorkspacePath));
-			const requestedPaths = new Set();
-			for (const call of calls) {
-				let readArguments;
-				try {
-					readArguments = parseCallArguments(call);
-				} catch (error) {
-					throw new Error(`A required read_file call had invalid arguments: ${error.message}`);
-				}
-				const normalizedPath = typeof readArguments.path === "string" ? normalizeWorkspacePath(readArguments.path) : "";
-				if (!expectedPaths.has(normalizedPath) || requestedPaths.has(normalizedPath)) {
-					throw new Error(`The required read_file calls must reread each changed path exactly once: ${forcedReadPaths.join(", ")}.`);
-				}
-				requestedPaths.add(normalizedPath);
-			}
+		// `let` because the forced-read fallback below may replace the calls.
+		let calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+		if (mustReadAfterFileChange && !requiredReadsHonored(calls, forcedReadPaths)) {
+			// The endpoint ignored the forced reread. Cerebras does this now and
+			// then with larger contexts (seen at ~36k tokens): it may answer with
+			// text, nothing, or a different tool, even with tool_choice "required".
+			// Before: MinAgent threw an error here and the whole turn was lost.
+			// Now: MinAgent issues the read_file calls itself. The loop below runs
+			// them like normal model calls, so the model still sees the new
+			// file contents and pendingRequiredReads is cleared.
+			const returned = calls.length > 0
+				? `tool calls: ${calls.map((call) => call?.function?.name || "?").join(", ")}`
+				: assistantText(message.content ?? "").trim() ? "text only" : "an empty reply";
+			uiPrint(uiText(`The endpoint skipped the required reread (${returned}). MinAgent is rereading ${forcedReadPaths.join(", ")} itself.`, "warning"));
+			calls = forcedReadPaths.map((path, index) => ({
+				id: `minagent-read-${round}-${index}`,
+				type: "function",
+				function: { name: "read_file", arguments: JSON.stringify({ path }) },
+			}));
 		}
 		if (calls.length === 0) {
 			const finalText = assistantText(message.content ?? message.refusal ?? "");
