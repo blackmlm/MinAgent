@@ -20,6 +20,7 @@ import { saveClipboardImage } from "./clipboard.mjs";
 import { readFile, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createErrorLog } from "./error-log.mjs";
 
 const MAX_TOOL_ROUNDS = 32;
 const MAX_ATTACHED_IMAGES = 4;
@@ -29,6 +30,9 @@ const BRACKETED_PASTE_ENABLE = "\u001b[?2004h";
 const BRACKETED_PASTE_DISABLE = "\u001b[?2004l";
 
 const appDirectory = dirname(fileURLToPath(import.meta.url));
+// Error log in <MinAgent folder>/logs/errors.jsonl (see error-log.mjs).
+// Built from appDirectory, so it also works for config errors at startup.
+const errorLog = createErrorLog(join(appDirectory, "..", "logs"));
 let applicationRoot;
 let rootDirectory;
 let workspaceName;
@@ -650,7 +654,21 @@ function printUserBubble(text) {
 	uiPrint(`${indent}${uiText(`╰${"─".repeat(contentWidth + 2)}╯`, "magenta")}`);
 }
 
+// Saves one error to the log, with context that helps debugging later.
+// Safe to call before configuration is loaded (fields are then undefined).
+function recordError(kind, message, extra = {}) {
+	let contextTokens;
+	try {
+		contextTokens = messages[0].content ? estimateCurrentContextTokens() : undefined;
+	} catch {
+		// The estimate is optional; never let it block logging.
+	}
+	errorLog.logError({ kind, message, workspace: workspaceName, model, contextTokens, ...extra });
+}
+
 function printError(error) {
+	// Every red ERROR box is also saved to the error log.
+	recordError("fatal", error instanceof Error ? error.message : String(error));
 	const text = safeTerminalText(error instanceof Error ? error.message : String(error));
 	const errorWidth = Math.max(4, (stdout.columns || 80) - 4);
 	print("");
@@ -1526,11 +1544,15 @@ function callChatCompletions(requestMessages, options = {}) {
 	// token_quota_exceeded gets its own wording: it is our per-minute token
 	// limit, not a busy server, so it waits longer (30s cooldowns).
 	// Before: onRetry printed a new warning line for every retry.
-	const waitBeforeRetry = ({ status, errorCode, retry, maxRetries, delayMs }) => showCountdown((secondsLeft) => (
-		errorCode === "token_quota_exceeded"
-			? `Token-per-minute limit reached (HTTP ${status}). Retrying in ${secondsLeft}s (cooldown ${retry}/${maxRetries})...`
-			: `Endpoint busy (HTTP ${status}). Retrying in ${secondsLeft}s (try ${retry}/${maxRetries})...`
-	), delayMs);
+	const waitBeforeRetry = ({ status, errorCode, retry, maxRetries, delayMs }) => {
+		// Log each busy/quota retry, to see how often the endpoint is overloaded.
+		recordError("endpoint_retry", `HTTP ${status} ${errorCode || ""}`.trim(), { status, errorCode, retry, maxRetries, delayMs });
+		return showCountdown((secondsLeft) => (
+			errorCode === "token_quota_exceeded"
+				? `Token-per-minute limit reached (HTTP ${status}). Retrying in ${secondsLeft}s (cooldown ${retry}/${maxRetries})...`
+				: `Endpoint busy (HTTP ${status}). Retrying in ${secondsLeft}s (try ${retry}/${maxRetries})...`
+		), delayMs);
+	};
 	return openAiClient.complete(requestMessages, { waitBeforeRetry, ...options });
 }
 
@@ -1602,6 +1624,8 @@ async function compactAutomaticallyIfNeeded() {
 		// Now: cut before an assistant message inside the turn instead.
 		cutIndex = findTurnCutPoint(conversationMessages, compactionKeepRecentTokens);
 		cutInsideTurn = true;
+		// Not an error, but a sign of a very heavy turn. Logged to spot patterns.
+		recordError("compaction_in_turn", "Compacted inside one long turn", { estimatedTokens, cutIndex });
 	}
 	if (cutIndex <= 0) {
 		throw new Error("The current workspace inventory or active turn exceeds the compaction threshold; reduce WORKSPACE_LIST_LIMIT or send a shorter request.");
@@ -1780,6 +1804,8 @@ async function requestAssistantTurn() {
 				const reasonText = finishReason === "length"
 					? "the model used all its output tokens (likely on reasoning)"
 					: `finish reason: ${finishReason || "unknown"}`;
+				// Log every empty reply, with the finish reason, to find the cause later.
+				recordError("empty_response", reasonText, { finishReason, retry: emptyResponseRetries });
 				if (emptyResponseRetries < 2) {
 					uiPrint(uiText(`The endpoint returned an empty response (${reasonText}); retrying once with a nudge.`, "warning"));
 					continue;
@@ -1831,6 +1857,12 @@ async function requestAssistantTurn() {
 			} catch (error) {
 				toolFailed = true;
 				result = `Error: ${error instanceof Error ? error.message : String(error)}`;
+			}
+			// Log failed tool calls: thrown errors, and results that start with
+			// "Error:" or "... denied by the user" without throwing (e.g. MCP).
+			// args is cut to 500 chars so big edit texts do not bloat the log.
+			if (toolFailed || (typeof result === "string" && /^(?:Error:|Permission denied by the user|MCP call denied by the user)/i.test(result))) {
+				recordError("tool", String(result).slice(0, 2000), { tool: name, args: JSON.stringify(args).slice(0, 500) });
 			}
 			const normalizedPath = typeof args.path === "string" ? normalizeWorkspacePath(args.path) : "";
 			if (name === "read_file" && normalizedPath && pendingRequiredReads.has(normalizedPath)) {
